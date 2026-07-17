@@ -118,7 +118,10 @@ data class AuthState(
     val avatarChar: String = "哲",
     val wechatBound: Boolean = false,    // 是否绑定微信
     val agreed: Boolean = false,         // 是否勾选协议
-    val showLogoutSheet: Boolean = false // 退出登录确认弹层
+    val showLogoutSheet: Boolean = false,// 退出登录确认弹层
+    val devCode: String = "",            // 短信通道未配置时服务端回传的联调验证码
+    val otpError: String = "",           // 验证码错误提示
+    val verifying: Boolean = false       // 云端校验中
 ) {
     /** 已进入 App（登录或游客）。 */
     val inApp: Boolean get() = loggedIn || guest
@@ -324,31 +327,72 @@ class PeopleNetViewModel : ViewModel() {
     fun authSetPhone(p: String) = updateAuth { it.copy(phone = p.filter { c -> c.isDigit() }.take(11)) }
     fun authToggleAgree() = updateAuth { it.copy(agreed = !it.agreed) }
 
-    /** 获取验证码 → 进入验证码页；同时在后台通知线上后端下发验证码（原型模式任意 6 位可过）。 */
+    /** 获取验证码：服务端真实下发（短信通道未配置时回传 devCode 展示在验证码页联调）。 */
     fun authSendCode() {
         val a = state.auth
         if (a.phone.length != 11) { showToast("请输入 11 位手机号"); return }
         if (!a.agreed) { showToast("请先阅读并同意用户协议与隐私政策"); return }
-        updateAuth { it.copy(stage = AuthStage.Otp, otp = "") }
-        val phone = a.phone
+        updateAuth { it.copy(stage = AuthStage.Otp, otp = "", otpError = "", devCode = "") }
+        requestOtpFromServer(a.phone)
+    }
+
+    fun authResendCode() {
+        updateAuth { it.copy(otp = "", otpError = "") }
+        requestOtpFromServer(state.auth.phone)
+    }
+
+    private fun requestOtpFromServer(phone: String) {
         viewModelScope.launch {
-            val ok = ApiClient.sendCode(phone)
-            android.util.Log.d("ApiClient", "sendCode($phone) → $ok")
+            val r = ApiClient.sendCode(phone)
+            when {
+                r == null -> showToast("网络异常 · 离线模式可用 123456")
+                !r.ok && r.retryAfter > 0 -> showToast("发送太频繁，${r.retryAfter} 秒后再试")
+                r.devCode.isNotBlank() -> updateAuth { it.copy(devCode = r.devCode) }
+                else -> showToast("验证码已发送")
+            }
         }
     }
 
-    fun authResendCode() { updateAuth { it.copy(otp = "") }; showToast("验证码已重新发送") }
-
-    /** 输入验证码；满 6 位自动校验并在后台完成云端登录（失败则离线继续，原型可用）。 */
+    /** 输入验证码；满 6 位提交云端强校验：错码拒绝，服务器不可达时回退离线模式。 */
     fun authSetOtp(o: String) {
+        if (state.auth.verifying) return
         val digits = o.filter { it.isDigit() }.take(6)
-        updateAuth { it.copy(otp = digits) }
-        if (digits.length == 6) {
-            updateAuth { it.copy(stage = AuthStage.Profile) }
-            val phone = state.auth.phone
-            viewModelScope.launch {
-                val ok = ApiClient.verify(phone, digits)
-                showToast(if (ok) "☁️ 云端登录成功" else "云端连接失败 · 离线模式")
+        updateAuth { it.copy(otp = digits, otpError = "") }
+        if (digits.length != 6) return
+        val phone = state.auth.phone
+        updateAuth { it.copy(verifying = true) }
+        viewModelScope.launch {
+            when (val r = ApiClient.verify(phone, digits)) {
+                is ApiClient.VerifyOutcome.Ok -> {
+                    if (r.isNew || r.nickname.isBlank()) {
+                        // 新用户 → 完善资料
+                        updateAuth { it.copy(verifying = false, stage = AuthStage.Profile) }
+                    } else {
+                        // 老用户 → 直接进 App，带回云端昵称
+                        updateAuth {
+                            it.copy(
+                                verifying = false, loggedIn = true,
+                                nickname = r.nickname, avatarChar = r.nickname.takeLast(1)
+                            )
+                        }
+                        showToast("☁️ 欢迎回来，${r.nickname}")
+                    }
+                }
+                is ApiClient.VerifyOutcome.Rejected -> {
+                    val hint = if (r.attemptsLeft in 0..4) "验证码不对，还可再试 ${r.attemptsLeft} 次"
+                    else when (r.message) {
+                        "code expired" -> "验证码已过期，请重新发送"
+                        "too many attempts, resend code" -> "错误次数过多，请重新发送验证码"
+                        "send code first" -> "请先获取验证码"
+                        else -> "验证失败：${r.message}"
+                    }
+                    updateAuth { it.copy(verifying = false, otp = "", otpError = hint) }
+                }
+                ApiClient.VerifyOutcome.Unreachable -> {
+                    // 离线兜底：进资料页，保证原型断网也能走完流程
+                    updateAuth { it.copy(verifying = false, stage = AuthStage.Profile) }
+                    showToast("云端连接失败 · 离线模式")
+                }
             }
         }
     }
@@ -378,10 +422,11 @@ class PeopleNetViewModel : ViewModel() {
 
     fun authSetNickname(n: String) = updateAuth { it.copy(nickname = n.take(12)) }
 
-    /** 完善资料 / 先跳过 → 进入 App。 */
+    /** 完善资料 / 先跳过 → 进入 App；昵称同步到云端。 */
     fun authFinishProfile() {
         val nick = state.auth.nickname.trim().ifEmpty { "新朋友" }
         updateAuth { it.copy(loggedIn = true, nickname = nick, avatarChar = nick.takeLast(1)) }
+        viewModelScope.launch { ApiClient.updateProfile(nick) }
     }
 
     /** 登录流程内返回上一步。 */

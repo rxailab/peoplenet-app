@@ -187,6 +187,16 @@ private fun OtpScreen(viewModel: PeopleNetViewModel) {
             },
             fontSize = 13.5.sp, color = AuthSub, modifier = Modifier.padding(top = 10.dp)
         )
+        // 短信通道未配置时，服务端回传验证码方便联调
+        if (auth.devCode.isNotBlank()) {
+            Text(
+                "测试验证码：${auth.devCode}（短信通道未配置，暂由服务器回传）",
+                fontSize = 12.sp, fontWeight = FontWeight.Bold, color = PurplePrimary,
+                modifier = Modifier.padding(top = 8.dp)
+                    .clip(RoundedCornerShape(10.dp)).background(Color(0xFFF4F0FF))
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+            )
+        }
         BasicTextField(
             value = auth.otp,
             onValueChange = { viewModel.authSetOtp(it) },
@@ -208,6 +218,12 @@ private fun OtpScreen(viewModel: PeopleNetViewModel) {
                 }
             }
         )
+        // 校验状态 / 错误提示
+        if (auth.verifying) {
+            Text("☁️ 校验中…", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = PurplePrimary, modifier = Modifier.padding(top = 14.dp))
+        } else if (auth.otpError.isNotBlank()) {
+            Text(auth.otpError, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFE85C8A), modifier = Modifier.padding(top = 14.dp))
+        }
         Row(
             horizontalArrangement = Arrangement.SpaceBetween,
             modifier = Modifier.fillMaxWidth().padding(top = 20.dp)

@@ -59,18 +59,48 @@ object ApiClient {
         request("GET", "/api/health", timeoutMs = 70000)
     }
 
-    suspend fun sendCode(phone: String): Boolean =
-        request("POST", "/api/auth/send-code", JSONObject().put("phone", phone))?.first == 200
+    /** 发送验证码结果。devCode 非空 = 短信通道未配置，服务端回传验证码联调。 */
+    data class SendCodeResult(val ok: Boolean, val devCode: String, val retryAfter: Int)
 
-    /** 验证码登录；成功后持有 JWT。 */
-    suspend fun verify(phone: String, code: String, nickname: String? = null): Boolean {
-        val body = JSONObject().put("phone", phone).put("code", code)
-        if (!nickname.isNullOrBlank()) body.put("nickname", nickname)
-        val r = request("POST", "/api/auth/verify", body) ?: return false
-        if (r.first != 200) return false
-        token = JSONObject(r.second).optString("token").takeIf { it.isNotBlank() }
-        return token != null
+    suspend fun sendCode(phone: String): SendCodeResult? {
+        val r = request("POST", "/api/auth/send-code", JSONObject().put("phone", phone)) ?: return null
+        val json = try { JSONObject(r.second) } catch (e: Exception) { JSONObject() }
+        return SendCodeResult(
+            ok = r.first == 200,
+            devCode = json.optString("devCode"),
+            retryAfter = json.optInt("retryAfter", 0)
+        )
     }
+
+    /** 验证码校验结果。 */
+    sealed class VerifyOutcome {
+        data class Ok(val nickname: String, val isNew: Boolean) : VerifyOutcome()
+        data class Rejected(val message: String, val attemptsLeft: Int) : VerifyOutcome()
+        object Unreachable : VerifyOutcome()
+    }
+
+    /** 验证码登录/注册；成功后持有 JWT。 */
+    suspend fun verify(phone: String, code: String): VerifyOutcome {
+        val body = JSONObject().put("phone", phone).put("code", code)
+        val r = request("POST", "/api/auth/verify", body) ?: return VerifyOutcome.Unreachable
+        val json = try { JSONObject(r.second) } catch (e: Exception) { JSONObject() }
+        if (r.first != 200) {
+            return VerifyOutcome.Rejected(
+                message = json.optString("error", "验证失败"),
+                attemptsLeft = json.optInt("attemptsLeft", -1)
+            )
+        }
+        token = json.optString("token").takeIf { it.isNotBlank() }
+        val user = json.optJSONObject("user")
+        return VerifyOutcome.Ok(
+            nickname = user?.optString("nickname") ?: "",
+            isNew = json.optBoolean("isNew", true)
+        )
+    }
+
+    /** 注册后完善昵称。 */
+    suspend fun updateProfile(nickname: String): Boolean =
+        request("PUT", "/api/auth/profile", JSONObject().put("nickname", nickname))?.first == 200
 
     /** 语音解析（服务端代理 Qwen）。返回模型 JSON 字符串；未登录云端或失败返回 null。 */
     suspend fun voiceParse(text: String, contacts: List<String>, today: String): String? {
