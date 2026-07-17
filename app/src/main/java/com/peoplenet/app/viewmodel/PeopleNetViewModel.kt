@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import com.peoplenet.app.net.ApiClient
 import com.peoplenet.app.net.DashScopeAsr
 import com.peoplenet.app.net.QwenConfig
 import com.peoplenet.app.net.QwenParse
@@ -299,6 +300,11 @@ class PeopleNetViewModel : ViewModel() {
     var state by mutableStateOf(AppState())
         private set
 
+    init {
+        // 唤醒 Render 免费实例（冷启动 ~50s），登录时后端大概率已就绪
+        viewModelScope.launch { ApiClient.warmup() }
+    }
+
     // Starts from the seed data; the "+" button appends new contacts at runtime.
     var contacts by mutableStateOf(SampleData.contacts)
         private set
@@ -318,21 +324,33 @@ class PeopleNetViewModel : ViewModel() {
     fun authSetPhone(p: String) = updateAuth { it.copy(phone = p.filter { c -> c.isDigit() }.take(11)) }
     fun authToggleAgree() = updateAuth { it.copy(agreed = !it.agreed) }
 
-    /** 获取验证码 → 进入验证码页。 */
+    /** 获取验证码 → 进入验证码页；同时在后台通知线上后端下发验证码（原型模式任意 6 位可过）。 */
     fun authSendCode() {
         val a = state.auth
         if (a.phone.length != 11) { showToast("请输入 11 位手机号"); return }
         if (!a.agreed) { showToast("请先阅读并同意用户协议与隐私政策"); return }
         updateAuth { it.copy(stage = AuthStage.Otp, otp = "") }
+        val phone = a.phone
+        viewModelScope.launch {
+            val ok = ApiClient.sendCode(phone)
+            android.util.Log.d("ApiClient", "sendCode($phone) → $ok")
+        }
     }
 
     fun authResendCode() { updateAuth { it.copy(otp = "") }; showToast("验证码已重新发送") }
 
-    /** 输入验证码；满 6 位自动校验（模拟：任意 6 位通过）。 */
+    /** 输入验证码；满 6 位自动校验并在后台完成云端登录（失败则离线继续，原型可用）。 */
     fun authSetOtp(o: String) {
         val digits = o.filter { it.isDigit() }.take(6)
         updateAuth { it.copy(otp = digits) }
-        if (digits.length == 6) updateAuth { it.copy(stage = AuthStage.Profile) }
+        if (digits.length == 6) {
+            updateAuth { it.copy(stage = AuthStage.Profile) }
+            val phone = state.auth.phone
+            viewModelScope.launch {
+                val ok = ApiClient.verify(phone, digits)
+                showToast(if (ok) "☁️ 云端登录成功" else "云端连接失败 · 离线模式")
+            }
+        }
     }
 
     /**
@@ -1276,11 +1294,28 @@ class PeopleNetViewModel : ViewModel() {
         }
     }
 
-    /** 优先 Qwen；未配置 KEY / 网络异常 / 空结果时回退本地规则解析。 */
+    /** 解析优先级：① 线上后端代理（key 在服务端）→ ② 直连 Qwen（客户端 key）→ ③ 本地规则。 */
     private suspend fun resolveVoiceParse(text: String): VoiceParse {
+        val names = contacts.map { it.name }
+        // ① 已云端登录 → 走服务端代理
+        if (ApiClient.token != null) {
+            val s = withTimeoutOrNull(26000) {
+                try { ApiClient.voiceParse(text, names, QwenConfig.TODAY) } catch (e: Exception) { null }
+            }
+            val q = s?.let { QwenService.parseServerJson(it) }
+            if (q != null && !q.isEmpty) {
+                val mapped = mapQwenParse(q)
+                if (!mapped.isEmpty) {
+                    android.util.Log.d("QwenVoice", "USING SERVER proxy result")
+                    return mapped
+                }
+            }
+            android.util.Log.d("QwenVoice", "server proxy empty/failed → direct Qwen")
+        }
+        // ② 直连 Qwen
         if (QwenConfig.enabled) {
             val q = withTimeoutOrNull(15000) {
-                try { QwenService.parse(text, contacts.map { it.name }, QwenConfig.TODAY) }
+                try { QwenService.parse(text, names, QwenConfig.TODAY) }
                 catch (e: Exception) { android.util.Log.w("QwenVoice", "call failed: $e"); null }
             }
             if (q != null && !q.isEmpty) {
@@ -1292,6 +1327,7 @@ class PeopleNetViewModel : ViewModel() {
             }
             android.util.Log.d("QwenVoice", "Qwen empty/failed → local fallback")
         }
+        // ③ 本地规则
         return parseVoiceInput(text)
     }
 

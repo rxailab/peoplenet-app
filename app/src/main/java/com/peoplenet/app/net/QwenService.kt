@@ -104,6 +104,9 @@ object QwenService {
 没有对应信息的字段用 null / false。person 为 null 且 new_contact 为 null 时，其它字段也应为 null。
 """.trim()
 
+    /** 解析服务端代理返回的同构 JSON（/api/voice/parse）。 */
+    fun parseServerJson(content: String): QwenParse? = parseContent(content)
+
     private fun parseContent(content: String): QwenParse? {
         val start = content.indexOf('{')
         val end = content.lastIndexOf('}')
